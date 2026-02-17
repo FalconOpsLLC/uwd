@@ -99,6 +99,48 @@ macro_rules! syscall {
     };
 }
 
+/// Invokes a Windows native syscall using a pre-resolved Nt* function address
+/// with a spoofed call stack.
+///
+/// This variant eliminates plaintext API name strings from the binary.
+/// The caller resolves the function address (e.g., via hash-based PEB walking)
+/// and passes it directly. SSN is extracted from the syscall stub using
+/// Halo's Gate technique.
+///
+/// # Examples
+///
+/// ```ignore
+/// use uwd::{syscall_addr, AsPointer};
+/// use core::ffi::c_void;
+///
+/// // Caller resolves NtAllocateVirtualMemory address by hash
+/// let nt_alloc_addr: *mut c_void = resolve_by_hash(0xDEADBEEF);
+///
+/// let mut addr = core::ptr::null_mut::<c_void>();
+/// let mut size = (1 << 12) as usize;
+/// let status = syscall_addr!(
+///     nt_alloc_addr,
+///     -1isize,
+///     addr.as_ptr_mut(),
+///     0,
+///     size.as_ptr_mut(),
+///     0x3000,
+///     0x04
+/// ).unwrap() as i32;
+/// ```
+#[macro_export]
+macro_rules! syscall_addr {
+    ($addr:expr, $($arg:expr),* $(,)?) => {
+        unsafe {
+            $crate::__private::spoof(
+                $addr as *mut core::ffi::c_void,
+                &[$(::core::mem::transmute($arg as usize)),*],
+                $crate::SpoofKind::SyscallAddr,
+            )
+        }
+    };
+}
+
 #[doc(hidden)]
 pub mod __private {
     use core::ffi::c_void;
@@ -228,6 +270,17 @@ pub mod __private {
                 config.spoof_function = dinvk::get_syscall_address(addr)
                     .context(s!("syscall address not found"))? as *const c_void;
             }
+            SpoofKind::SyscallAddr => {
+                if addr.is_null() {
+                    bail!(s!("null syscall address for SyscallAddr"));
+                }
+
+                config.is_syscall = true as u32;
+                config.ssn = unsafe { extract_ssn_from_addr(addr as *const u8) }
+                    .context(s!("ssn extraction failed"))? as u32;
+                config.spoof_function = dinvk::get_syscall_address(addr)
+                    .context(s!("syscall address not found"))? as *const c_void;
+            }
         }
 
         Ok(unsafe { SpoofSynthetic(&mut config) })
@@ -329,6 +382,17 @@ pub mod __private {
 
                 config.is_syscall = true as u32;
                 config.ssn = dinvk::ssn(name, ntdll).context(s!("ssn not found"))?.into();
+                config.spoof_function = dinvk::get_syscall_address(addr)
+                    .context(s!("syscall address not found"))? as *const c_void;
+            }
+            SpoofKind::SyscallAddr => {
+                if addr.is_null() {
+                    bail!(s!("null syscall address for SyscallAddr"));
+                }
+
+                config.is_syscall = true as u32;
+                config.ssn = unsafe { extract_ssn_from_addr(addr as *const u8) }
+                    .context(s!("ssn extraction failed"))? as u32;
                 config.spoof_function = dinvk::get_syscall_address(addr)
                     .context(s!("syscall address not found"))? as *const c_void;
             }
@@ -893,6 +957,63 @@ pub fn ignoring_set_fpreg(module: *mut c_void, runtime: &IMAGE_RUNTIME_FUNCTION)
     }
 }
 
+/// Check if a pointer points to an unhooked Nt* syscall stub.
+/// Pattern: 4C 8B D1 B8 (mov r10, rcx; mov eax, imm32)
+#[inline]
+unsafe fn is_clean_stub(ptr: *const u8) -> bool {
+    unsafe {
+        core::ptr::read_volatile(ptr) == 0x4C
+            && core::ptr::read_volatile(ptr.add(1)) == 0x8B
+            && core::ptr::read_volatile(ptr.add(2)) == 0xD1
+            && core::ptr::read_volatile(ptr.add(3)) == 0xB8
+    }
+}
+
+/// Extract System Service Number from an Nt* function stub address.
+///
+/// Uses Halo's Gate technique: if the target stub is hooked (no clean pattern),
+/// searches neighboring stubs (spaced 32 bytes apart) and calculates the target
+/// SSN based on distance from an unhooked neighbor.
+unsafe fn extract_ssn_from_addr(func: *const u8) -> Option<u16> {
+    const STUB_SIZE: isize = 32;
+
+    unsafe {
+        // Clean stub: directly read SSN at offset +4
+        if is_clean_stub(func) {
+            return Some(core::ptr::read_volatile(func.add(4) as *const u16));
+        }
+
+        // Halo's Gate: search neighboring stubs
+        for offset in 1..=500isize {
+            let byte_offset = offset * STUB_SIZE;
+
+            // Check forward neighbor (higher SSN)
+            let fwd = func.offset(byte_offset);
+            if is_clean_stub(fwd) {
+                let neighbor_ssn = core::ptr::read_volatile(fwd.add(4) as *const u16) as i32;
+                let target_ssn = neighbor_ssn - offset as i32;
+                if target_ssn >= 0 {
+                    return Some(target_ssn as u16);
+                }
+            }
+
+            // Check backward neighbor (lower SSN)
+            if (func as usize) >= byte_offset as usize {
+                let bwd = func.offset(-byte_offset);
+                if is_clean_stub(bwd) {
+                    let neighbor_ssn = core::ptr::read_volatile(bwd.add(4) as *const u16) as i32;
+                    let target_ssn = neighbor_ssn + offset as i32;
+                    if target_ssn >= 0 && target_ssn <= 0xFFFF {
+                        return Some(target_ssn as u16);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
 /// Trait for safely converting any reference or mutable reference into a raw
 /// pointer usable in spoofing routines.
 pub trait AsPointer {
@@ -920,8 +1041,14 @@ pub enum SpoofKind<'a> {
     /// Spoofs a direct function call.
     Function,
 
-    /// Spoofs a syscall using its name.
+    /// Spoofs a syscall using its name (leaves plaintext strings in binary).
     Syscall(&'a str),
+
+    /// Spoofs a syscall using a pre-resolved Nt* function address.
+    /// The address is passed via the `addr` parameter to `spoof()`.
+    /// SSN is extracted from the syscall stub using Halo's Gate.
+    /// No strings appear in the binary.
+    SyscallAddr,
 }
 
 #[cfg(test)]
