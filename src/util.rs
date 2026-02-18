@@ -80,13 +80,15 @@ pub fn find_gadget(
 /// the range of the `BaseThreadInitThunk` function from `kernel32.dll`.
 #[cfg(feature = "desync")]
 pub fn find_base_thread_return_address() -> Option<usize> {
-    use dinvk::module::{get_module_address, get_proc_address};
-    use dinvk::{hash::{jenkins3, murmur3}, helper::PE};
+    use dinvk::module::get_proc_address;
+    use dinvk::hash::jenkins3;
+    use dinvk::helper::PE;
     use crate::types::Unwind;
+    use crate::cache::cached_kernel32;
 
     unsafe {
-        // Get handle for kernel32.dll
-        let kernel32 = get_module_address(2808682670u32, Some(murmur3));
+        // Use pre-seeded kernel32 base (no PEB walk)
+        let kernel32 = cached_kernel32();
         if kernel32.is_null() {
             return None;
         }

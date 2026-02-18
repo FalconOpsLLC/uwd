@@ -3,10 +3,12 @@ use core::ffi::c_void;
 
 use anyhow::{Context, Result, bail};
 use obfstr::obfstring as s;
-use dinvk::module::{get_module_address, get_proc_address};
+use dinvk::module::get_proc_address;
 use dinvk::types::IMAGE_RUNTIME_FUNCTION;
 use dinvk::hash::murmur3;
 use dinvk::helper::PE;
+
+use crate::cache::{cached_ntdll, cached_kernel32, cached_kernelbase};
 
 #[cfg(feature = "desync")]
 use crate::util::find_base_thread_return_address;
@@ -161,8 +163,11 @@ pub mod __private {
 
         let mut config = Config::default();
 
-        // Resolve kernelbase
-        let kernelbase = get_module_address(2737729883u32, Some(murmur3));
+        // Use pre-seeded module bases (no PEB walk)
+        let kernelbase = cached_kernelbase();
+        if kernelbase.is_null() {
+            bail!(s!("kernelbase not cached — call init_module_bases first"));
+        }
 
         // Parse unwind table
         let pe_kernelbase = Unwind::new(PE::parse(kernelbase));
@@ -172,13 +177,13 @@ pub mod __private {
                 "failed to read IMAGE_RUNTIME_FUNCTION entries from .pdata section"
             ))?;
 
-        // Resolve APIs
-        let ntdll = get_module_address(2788516083u32, Some(murmur3));
+        // Resolve APIs from cached bases
+        let ntdll = cached_ntdll();
         if ntdll.is_null() {
-            bail!(s!("ntdll.dll not found"));
+            bail!(s!("ntdll not cached — call init_module_bases first"));
         }
 
-        let kernel32 = get_module_address(2808682670u32, Some(murmur3));
+        let kernel32 = cached_kernel32();
         let rlt_user_addr = get_proc_address(ntdll, 1578834099u32, Some(murmur3));
         let base_thread_addr = get_proc_address(kernel32, 4083630997u32, Some(murmur3));
 
@@ -260,13 +265,14 @@ pub mod __private {
         match kind {
             SpoofKind::Function => config.spoof_function = addr,
             SpoofKind::Syscall(name) => {
-                let addr = get_proc_address(ntdll, name, None);
+                let syscall_ntdll = cached_ntdll();
+                let addr = get_proc_address(syscall_ntdll, name, None);
                 if addr.is_null() {
                     bail!(s!("get_proc_address returned null"));
                 }
 
                 config.is_syscall = true as u32;
-                config.ssn = dinvk::ssn(name, ntdll).context(s!("ssn not found"))?.into();
+                config.ssn = dinvk::ssn(name, syscall_ntdll).context(s!("ssn not found"))?.into();
                 config.spoof_function = dinvk::get_syscall_address(addr)
                     .context(s!("syscall address not found"))? as *const c_void;
             }
@@ -301,8 +307,11 @@ pub mod __private {
 
         let mut config = Config::default();
 
-        // Resolve kernelbase
-        let kernelbase = get_module_address(2737729883u32, Some(murmur3));
+        // Use pre-seeded module bases (no PEB walk)
+        let kernelbase = cached_kernelbase();
+        if kernelbase.is_null() {
+            bail!(s!("kernelbase not cached — call init_module_bases first"));
+        }
 
         // Parse unwind table
         let pe = Unwind::new(PE::parse(kernelbase));
@@ -370,9 +379,9 @@ pub mod __private {
         match kind {
             SpoofKind::Function => config.spoof_function = addr,
             SpoofKind::Syscall(name) => {
-                let ntdll = get_module_address(2788516083u32, Some(murmur3));
+                let ntdll = cached_ntdll();
                 if ntdll.is_null() {
-                    bail!(s!("ntdll.dll not found"));
+                    bail!(s!("ntdll not cached — call init_module_bases first"));
                 }
 
                 let addr = get_proc_address(ntdll, name, None);
@@ -1057,9 +1066,19 @@ mod tests {
     use alloc::boxed::Box;
     use super::*;
 
+    /// Tests use dinvk directly to bootstrap the cache (test-only PEB walk).
+    fn seed_cache_for_tests() {
+        use dinvk::module::get_module_address;
+        let ntdll = get_module_address("ntdll.dll", None);
+        let kernel32 = get_module_address("kernel32.dll", None);
+        let kernelbase = get_module_address("kernelbase.dll", None);
+        crate::cache::init_module_bases(ntdll, kernel32, kernelbase);
+    }
+
     #[test]
     fn test_spoof() -> Result<(), Box<dyn core::error::Error>> {
-        let kernel32 = get_module_address("kernel32.dll", None);
+        seed_cache_for_tests();
+        let kernel32 = cached_kernel32();
         let virtual_alloc = get_proc_address(kernel32, "VirtualAlloc", None);   
         let addr = spoof!(virtual_alloc, ptr::null_mut::<c_void>(), 1 << 12, 0x3000, 0x04)?;
         assert_ne!(addr, ptr::null_mut());
@@ -1069,6 +1088,7 @@ mod tests {
 
     #[test]
     fn test_syscall() -> Result<(), Box<dyn core::error::Error>> {
+        seed_cache_for_tests();
         let mut addr = ptr::null_mut::<c_void>();
         let mut size = (1 << 12) as usize;
         let status = syscall!("NtAllocateVirtualMemory", -1isize, addr.as_ptr_mut(), 0, size.as_ptr_mut(), 0x3000, 0x04)? as i32;
