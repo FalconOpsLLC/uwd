@@ -8,5 +8,5 @@ mod types;
 mod uwd;
 mod util;
 
-pub use cache::init_module_bases;
+pub use cache::{init_module_bases, init_win32u_base};
 pub use uwd::*;

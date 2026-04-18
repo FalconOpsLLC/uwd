@@ -35,6 +35,12 @@ nasm-rs = "0.3.0"
 [features]
 default = []
 desync = []
+# ROP Hells' Hall — pivot the syscall;ret gadget from ntdll to win32u.
+# SSN is still extracted from the ntdll stub (Halo's Gate), but the gadget
+# used to `call` into the kernel lives in win32u.dll (GUI syscalls, rarely
+# hooked). Callers must seed the win32u base via `init_win32u_base()` before
+# any syscall; if the cache is empty, the pivot falls back to ntdll.
+win32u_pivot = []
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
