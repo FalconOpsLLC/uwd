@@ -1037,8 +1037,12 @@ unsafe fn extract_ssn_from_addr(func: *const u8) -> Option<u16> {
 /// If `win32u_pivot` is compiled in but the win32u base has not been seeded
 /// (`init_win32u_base` never called), this falls back to the ntdll gadget —
 /// never silently fails a syscall just because the cache is cold.
+///
+/// Exposed publicly so callers that hand-roll their own indirect syscall
+/// sequences (e.g. when they need more arguments than `syscall!`/`syscall_addr!`
+/// support) can share the same pivot policy as the macros.
 #[allow(unused_variables)]
-unsafe fn resolve_syscall_gadget(addr: *mut c_void) -> Option<u64> {
+pub unsafe fn resolve_syscall_gadget(addr: *mut c_void) -> Option<u64> {
     #[cfg(feature = "win32u_pivot")]
     {
         let win32u = cached_win32u();
@@ -1067,23 +1071,47 @@ unsafe fn find_win32u_syscall_gadget(base: *mut c_void) -> Option<u64> {
     unsafe {
         let base_u = base as usize;
         let dos = base as *const u8;
+        // MZ signature
+        if core::ptr::read_unaligned(dos as *const u16) != 0x5A4D {
+            return None;
+        }
         let e_lfanew = core::ptr::read_unaligned(dos.add(0x3C) as *const i32);
         if e_lfanew <= 0 || e_lfanew > 0x1000 {
             return None;
         }
         let nt = dos.add(e_lfanew as usize);
-        // OptionalHeader.DataDirectory[0] = Export table (RVA, size) at NT+0x70 for PE32+
-        let export_rva = core::ptr::read_unaligned(nt.add(0x70) as *const u32) as usize;
-        if export_rva == 0 {
+        // PE\0\0 signature
+        if core::ptr::read_unaligned(nt as *const u32) != 0x00004550 {
+            return None;
+        }
+        // PE32+ layout from NT header start:
+        //   +0x00 Signature (4), +0x04 IMAGE_FILE_HEADER (20),
+        //   +0x18 IMAGE_OPTIONAL_HEADER64 starts here.
+        // SizeOfImage at NT + 0x50 — use it to bound-check every RVA below.
+        let size_of_image = core::ptr::read_unaligned(nt.add(0x50) as *const u32) as usize;
+        if size_of_image == 0 || size_of_image > 0x1000_0000 {
+            return None;
+        }
+        // DataDirectory[0] (Export) lives at offset 112 INSIDE the optional
+        // header, i.e. NT + 0x18 + 0x70 = NT + 0x88.
+        let export_rva = core::ptr::read_unaligned(nt.add(0x88) as *const u32) as usize;
+        if export_rva == 0 || export_rva + 0x28 > size_of_image {
             return None;
         }
         let export_dir = dos.add(export_rva);
         let num_names = core::ptr::read_unaligned(export_dir.add(0x18) as *const u32) as usize;
-        if num_names == 0 {
+        if num_names == 0 || num_names > 0x10000 {
             return None;
         }
         let addrs_rva = core::ptr::read_unaligned(export_dir.add(0x1C) as *const u32) as usize;
         let ord_rva = core::ptr::read_unaligned(export_dir.add(0x24) as *const u32) as usize;
+        // Both tables must lie fully inside the image.
+        if addrs_rva == 0 || ord_rva == 0
+            || addrs_rva + num_names * 4 > size_of_image
+            || ord_rva + num_names * 2 > size_of_image
+        {
+            return None;
+        }
         let addrs = dos.add(addrs_rva) as *const u32;
         let ords = dos.add(ord_rva) as *const u16;
 
@@ -1098,12 +1126,18 @@ unsafe fn find_win32u_syscall_gadget(base: *mut c_void) -> Option<u64> {
         state ^= state >> 17;
         state ^= state << 5;
 
+        let num_funcs = core::ptr::read_unaligned(export_dir.add(0x14) as *const u32) as usize;
         let start = (state as usize) % num_names;
         for i in 0..num_names {
             let idx = (start + i) % num_names;
             let ord = core::ptr::read_unaligned(ords.add(idx)) as usize;
+            if ord >= num_funcs {
+                continue;
+            }
             let func_rva = core::ptr::read_unaligned(addrs.add(ord)) as usize;
-            if func_rva == 0 {
+            // Stub must sit inside the image with room for the 3-byte pair
+            // plus the scan window.
+            if func_rva == 0 || func_rva + STUB_SCAN + 3 > size_of_image {
                 continue;
             }
             let stub = (base_u + func_rva) as *const u8;
